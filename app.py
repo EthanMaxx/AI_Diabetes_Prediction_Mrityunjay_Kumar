@@ -1,346 +1,488 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import pickle
 import logging
 import os
+import pickle
 from datetime import datetime
+from typing import Any, Dict, Tuple, Optional, List
 
-# Set up logging
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# -------------------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------------------
+
+LOG_FILE = "app_logs.log"
+PREDICTION_LOG_DIR = "prediction_logs"
+MODEL_PATH = "diabetes_model.pkl"
+FEATURE_NAMES_PATH = "feature_names.pkl"
+
+# Risk thresholds for probability
+LOW_RISK_THRESHOLD = 0.30
+HIGH_RISK_THRESHOLD = 0.70
+
+# Physiological bounds for validation
+PHYSIOLOGICAL_BOUNDS: Dict[str, Tuple[float, float]] = {
+    "Pregnancies": (0, 25),                # max pregnancies unlikely to exceed 25
+    "Glucose": (40, 500),                  # wide range to capture extreme cases
+    "BloodPressure": (40, 250),            # diastolic; wide range
+    "SkinThickness": (0, 100),             # mm
+    "Insulin": (0, 1000),                  # mu U/ml
+    "BMI": (10.0, 80.0),                   # kg/m²
+    "DiabetesPedigreeFunction": (0.0, 3.0),
+    "Age": (0, 120),
+}
+
+# -------------------------------------------------------------------
+# LOGGING SETUP
+# -------------------------------------------------------------------
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler("app_logs.log"),
-        logging.StreamHandler()
-    ]
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(),
+    ],
 )
 logger = logging.getLogger(__name__)
 
-# Load the model and feature names
+# -------------------------------------------------------------------
+# MODEL LOADING
+# -------------------------------------------------------------------
+
+
 @st.cache_resource
-def load_model():
+def load_model() -> Tuple[Optional[Any], Optional[List[str]]]:
+    """
+    Load the trained model and the ordered list of feature names.
+
+    Returns
+    -------
+    model : sklearn-compatible estimator or None
+    feature_names : list of str or None
+    """
     try:
-        with open('diabetes_model.pkl', 'rb') as file:
-            model = pickle.load(file)
-        with open('feature_names.pkl', 'rb') as file:
-            feature_names = pickle.load(file)
-        return model, feature_names
-    except Exception as e:
-        logger.error(f"Error loading model: {e}")
+        with open(MODEL_PATH, "rb") as f:
+            model = pickle.load(f)
+
+        with open(FEATURE_NAMES_PATH, "rb") as f:
+            feature_names = pickle.load(f)
+
+        if not isinstance(feature_names, (list, tuple)):
+            raise ValueError("feature_names.pkl does not contain a list of feature names.")
+
+        logger.info("Model and feature names loaded successfully.")
+        return model, list(feature_names)
+
+    except Exception as exc:
+        logger.error(f"Error loading model or feature names: {exc}")
         st.error("Failed to load the prediction model. Please contact support.")
         return None, None
 
-# Define physiological bounds for each feature
-PHYSIOLOGICAL_BOUNDS = {
-    'Pregnancies': (0, 25),  # Maximum pregnancies unlikely to exceed 25
-    'Glucose': (40, 500),    # Normal range is 70-140, but allowing wider range for extreme cases
-    'BloodPressure': (40, 250),  # Normal range is 90/60 to 120/80, but allowing wider range
-    'SkinThickness': (0, 100),  # In mm, unlikely to exceed 100mm
-    'Insulin': (0, 1000),    # Fasting insulin rarely exceeds 300, but allowing wider range
-    'BMI': (10, 80),         # Normal range is 18.5-24.9, but allowing wider range
-    'DiabetesPedigreeFunction': (0, 3),  # Based on dataset distribution
-    'Age': (0, 120)          # Human age range
-}
 
-# Function to validate input within physiological bounds
-def validate_input(feature, value):
-    if feature in PHYSIOLOGICAL_BOUNDS:
-        min_val, max_val = PHYSIOLOGICAL_BOUNDS[feature]
-        if value < min_val or value > max_val:
-            return False, f"{feature} should be between {min_val} and {max_val}."
+# -------------------------------------------------------------------
+# INPUT VALIDATION & FEATURE ENGINEERING
+# -------------------------------------------------------------------
+
+
+def validate_input(feature: str, value: float) -> Tuple[bool, str]:
+    """
+    Validate a single input value against physiological bounds.
+
+    Parameters
+    ----------
+    feature : str
+        Feature name as used in PHYSIOLOGICAL_BOUNDS.
+    value : float
+        Numeric value provided by the user.
+
+    Returns
+    -------
+    (is_valid, error_message) : (bool, str)
+    """
+    bounds = PHYSIOLOGICAL_BOUNDS.get(feature)
+    if bounds is None:
+        # If not configured, treat as valid (no constraints)
+        return True, ""
+
+    min_val, max_val = bounds
+    if value < min_val or value > max_val:
+        return False, f"{feature} should be between {min_val} and {max_val}."
+
     return True, ""
 
-# Function to engineer features from input
-def engineer_features(input_data):
+
+def engineer_features(input_data: Dict[str, float]) -> Dict[str, float]:
+    """
+    Engineer additional features from raw inputs.
+
+    Adds:
+    - BMI category one-hot features
+    - Glucose category one-hot features
+    - Interaction terms: Glucose*BMI, Age*BMI
+    """
     try:
-        # Create BMI categories
-        bmi = input_data['BMI']
+        engineered = dict(input_data)  # work on a copy
+
+        # ---------------------------
+        # BMI categories
+        # ---------------------------
+        bmi = engineered["BMI"]
+
+        engineered["BMI_Category_Normal"] = 0
+        engineered["BMI_Category_Overweight"] = 0
+        engineered["BMI_Category_Obese"] = 0
+
         if bmi < 18.5:
-            input_data['BMI_Category_Normal'] = 0
-            input_data['BMI_Category_Obese'] = 0
-            input_data['BMI_Category_Overweight'] = 0
+            # Underweight – not explicitly modelled, all zeros
+            pass
         elif bmi < 25:
-            input_data['BMI_Category_Normal'] = 1
-            input_data['BMI_Category_Obese'] = 0
-            input_data['BMI_Category_Overweight'] = 0
+            engineered["BMI_Category_Normal"] = 1
         elif bmi < 30:
-            input_data['BMI_Category_Normal'] = 0
-            input_data['BMI_Category_Obese'] = 0
-            input_data['BMI_Category_Overweight'] = 1
+            engineered["BMI_Category_Overweight"] = 1
         else:
-            input_data['BMI_Category_Normal'] = 0
-            input_data['BMI_Category_Obese'] = 1
-            input_data['BMI_Category_Overweight'] = 0
-        
-        # Create glucose categories
-        glucose = input_data['Glucose']
+            engineered["BMI_Category_Obese"] = 1
+
+        # ---------------------------
+        # Glucose categories
+        # ---------------------------
+        glucose = engineered["Glucose"]
+
+        engineered["Glucose_Category_Normal"] = 0
+        engineered["Glucose_Category_Prediabetes"] = 0
+        engineered["Glucose_Category_Diabetes"] = 0
+
         if glucose < 70:
-            input_data['Glucose_Category_Normal'] = 0
-            input_data['Glucose_Category_Prediabetes'] = 0
-            input_data['Glucose_Category_Diabetes'] = 0
+            # Hypoglycaemia – not explicitly modelled, all zeros
+            pass
         elif glucose < 100:
-            input_data['Glucose_Category_Normal'] = 1
-            input_data['Glucose_Category_Prediabetes'] = 0
-            input_data['Glucose_Category_Diabetes'] = 0
+            engineered["Glucose_Category_Normal"] = 1
         elif glucose < 126:
-            input_data['Glucose_Category_Normal'] = 0
-            input_data['Glucose_Category_Prediabetes'] = 1
-            input_data['Glucose_Category_Diabetes'] = 0
+            engineered["Glucose_Category_Prediabetes"] = 1
         else:
-            input_data['Glucose_Category_Normal'] = 0
-            input_data['Glucose_Category_Prediabetes'] = 0
-            input_data['Glucose_Category_Diabetes'] = 1
-        
-        # Create interaction features
-        input_data['Glucose_BMI'] = input_data['Glucose'] * input_data['BMI']
-        input_data['Age_BMI'] = input_data['Age'] * input_data['BMI']
-        
-        return input_data
-    except Exception as e:
-        logger.error(f"Error in feature engineering: {e}")
+            engineered["Glucose_Category_Diabetes"] = 1
+
+        # ---------------------------
+        # Interaction features
+        # ---------------------------
+        engineered["Glucose_BMI"] = engineered["Glucose"] * engineered["BMI"]
+        engineered["Age_BMI"] = engineered["Age"] * engineered["BMI"]
+
+        return engineered
+
+    except KeyError as exc:
+        logger.error(f"Missing key in engineer_features: {exc}")
+        raise
+    except Exception as exc:
+        logger.error(f"Unexpected error in engineer_features: {exc}")
         raise
 
-# Function to make predictions
-def predict_diabetes(input_data, model, feature_names):
+
+# -------------------------------------------------------------------
+# PREDICTION + LOGGING
+# -------------------------------------------------------------------
+
+
+def predict_diabetes(
+    input_data: Dict[str, float],
+    model: Any,
+    feature_names: List[str],
+) -> Tuple[Optional[int], Optional[float]]:
+    """
+    Run the model on a single patient's data.
+
+    Returns
+    -------
+    prediction : int or None
+        1 for high risk, 0 for low risk.
+    probability : float or None
+        Predicted probability of diabetes (class 1).
+    """
     try:
-        # Engineer features
-        engineered_data = engineer_features(input_data)
-        
-        # Create a DataFrame with the correct feature order
-        input_df = pd.DataFrame([engineered_data])
-        
-        # Ensure all required features are present
-        for feature in feature_names:
-            if feature not in input_df.columns:
-                input_df[feature] = 0
-        
-        # Select only the features needed by the model
+        engineered = engineer_features(input_data)
+
+        # Build DataFrame with engineered features
+        input_df = pd.DataFrame([engineered])
+
+        # Ensure all required features exist; fill missing with 0
+        for feat in feature_names:
+            if feat not in input_df.columns:
+                input_df[feat] = 0
+
+        # Use exact model feature ordering
         input_df = input_df[feature_names]
-        
-        # Make prediction
+
         prediction = model.predict(input_df)
-        probability = model.predict_proba(input_df)[0][1]
-        
-        return prediction[0], probability
-    except Exception as e:
-        logger.error(f"Error in prediction: {e}")
-        st.error(f"An error occurred during prediction: {e}")
+        proba = model.predict_proba(input_df)[0][1]
+
+        return int(prediction[0]), float(proba)
+
+    except Exception as exc:
+        logger.error(f"Error in prediction: {exc}")
+        st.error(f"An error occurred during prediction: {exc}")
         return None, None
 
-# Function to log user inputs and predictions
-def log_prediction(input_data, prediction, probability):
-    try:
-        log_dir = "prediction_logs"
-        os.makedirs(log_dir, exist_ok=True)
-        
-        log_file = os.path.join(log_dir, f"predictions_{datetime.now().strftime('%Y%m%d')}.csv")
-        
-        # Prepare log data
-        log_data = input_data.copy()
-        log_data['prediction'] = prediction
-        log_data['probability'] = probability
-        log_data['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Convert to DataFrame
-        log_df = pd.DataFrame([log_data])
-        
-        # Append to log file
-        if os.path.exists(log_file):
-            log_df.to_csv(log_file, mode='a', header=False, index=False)
-        else:
-            log_df.to_csv(log_file, index=False)
-            
-        logger.info(f"Prediction logged: {prediction}, probability: {probability:.4f}")
-    except Exception as e:
-        logger.error(f"Error logging prediction: {e}")
 
-# Main Streamlit app
-def main():
+def log_prediction(input_data: Dict[str, float], prediction: int, probability: float) -> None:
+    """
+    Persist the input features and prediction for monitoring.
+
+    Logs to: prediction_logs/predictions_YYYYMMDD.csv
+    """
+    try:
+        os.makedirs(PREDICTION_LOG_DIR, exist_ok=True)
+        fname = f"predictions_{datetime.now().strftime('%Y%m%d')}.csv"
+        log_file = os.path.join(PREDICTION_LOG_DIR, fname)
+
+        row = dict(input_data)
+        row["prediction"] = prediction
+        row["probability"] = probability
+        row["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        df = pd.DataFrame([row])
+
+        if os.path.exists(log_file):
+            df.to_csv(log_file, mode="a", header=False, index=False)
+        else:
+            df.to_csv(log_file, index=False)
+
+        logger.info(f"Logged prediction={prediction}, probability={probability:.4f}")
+
+    except Exception as exc:
+        logger.error(f"Error logging prediction: {exc}")
+
+
+# -------------------------------------------------------------------
+# UI HELPERS
+# -------------------------------------------------------------------
+
+
+def display_risk_block(prediction: int, probability: float) -> None:
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if prediction == 1:
+            st.error("⚠️ High Risk of Diabetes")
+        else:
+            st.success("✅ Low Risk of Diabetes")
+
+    with col2:
+        st.metric("Predicted Probability", f"{probability:.1%}")
+
+
+def display_risk_interpretation(probability: float) -> None:
+    st.subheader("Risk Interpretation")
+
+    if probability < LOW_RISK_THRESHOLD:
+        st.write("**Low Risk:** The model predicts a low probability of diabetes.")
+        st.write("Recommendation: Maintain a healthy lifestyle with regular exercise and a balanced diet.")
+    elif probability < HIGH_RISK_THRESHOLD:
+        st.write("**Moderate Risk:** There are some indicators suggesting elevated risk of diabetes.")
+        st.write("Recommendation: Consider consulting with a healthcare provider for further evaluation.")
+    else:
+        st.write("**High Risk:** The model predicts a high probability of diabetes.")
+        st.write("Recommendation: Please consult with a healthcare provider as soon as possible for diagnosis and care.")
+
+
+def display_risk_factors(glucose: float, bmi: float, dpf: float, age: int) -> None:
+    st.subheader("Key Risk Factors")
+
+    factors = []
+
+    if glucose > 125:
+        factors.append(
+            (
+                "High Glucose Level",
+                f"{glucose} mg/dL",
+                "Elevated blood glucose is a primary indicator of diabetes.",
+            )
+        )
+
+    if bmi > 30:
+        factors.append(
+            ("Obesity", f"BMI: {bmi:.1f}", "Obesity is strongly associated with type 2 diabetes.")
+        )
+
+    if dpf > 0.8:
+        factors.append(
+            (
+                "Family History",
+                f"Diabetes Pedigree Function: {dpf:.3f}",
+                "A high diabetes pedigree function indicates genetic predisposition.",
+            )
+        )
+
+    if age > 45:
+        factors.append(
+            (
+                "Age",
+                f"{age} years",
+                "Risk of type 2 diabetes increases with age.",
+            )
+        )
+
+    if factors:
+        for title, value, desc in factors:
+            st.write(f"**{title}:** {value}")
+            st.write(desc)
+    else:
+        st.write("No specific high-risk factors identified based on the entered values.")
+
+
+def display_disclaimer() -> None:
+    st.info(
+        """
+**Disclaimer:** This prediction is based on a machine learning model and is intended
+for educational purposes only. It is **not** a substitute for professional medical
+advice, diagnosis, or treatment. Please consult a qualified healthcare professional
+for any health concerns.
+"""
+    )
+
+
+# -------------------------------------------------------------------
+# MAIN STREAMLIT APP
+# -------------------------------------------------------------------
+
+
+def main() -> None:
     st.set_page_config(
         page_title="Diabetes Risk Prediction System",
         page_icon="🩺",
-        layout="wide"
+        layout="wide",
     )
-    
+
     st.title("Diabetes Risk Prediction System")
-    st.write("""
-    ### Supply Chain Approach to Healthcare
-    This system uses machine learning to predict diabetes risk based on clinical and demographic features.
-    Please enter your information below for an assessment.
-    """)
-    
-    # Load the model
+    st.write(
+        """
+### Supply Chain Approach to Healthcare
+
+This system uses a machine learning model to estimate diabetes risk based on clinical
+and demographic features. Please enter the information in the sidebar for an assessment.
+"""
+    )
+
+    # Load model
     model, feature_names = load_model()
-    if model is None:
+    if model is None or feature_names is None:
         st.stop()
-    
-    # Create a sidebar for inputs
+
+    # Sidebar input form
     st.sidebar.header("Patient Information")
-    
-    # Initialize error message container
     error_container = st.empty()
-    
+
     try:
-        # Input form
         with st.sidebar.form("patient_data_form"):
             col1, col2 = st.columns(2)
-            
+
             with col1:
                 pregnancies = st.number_input("Number of Pregnancies", min_value=0, max_value=25, value=0)
                 glucose = st.number_input("Glucose Level (mg/dL)", min_value=40, max_value=500, value=120)
                 blood_pressure = st.number_input("Blood Pressure (mm Hg)", min_value=40, max_value=250, value=80)
                 skin_thickness = st.number_input("Skin Thickness (mm)", min_value=0, max_value=100, value=20)
-            
+
             with col2:
                 insulin = st.number_input("Insulin Level (mu U/ml)", min_value=0, max_value=1000, value=79)
                 bmi = st.number_input("BMI", min_value=10.0, max_value=80.0, value=25.0, format="%.1f")
-                dpf = st.number_input("Diabetes Pedigree Function", min_value=0.0, max_value=3.0, value=0.5, format="%.3f")
+                dpf = st.number_input(
+                    "Diabetes Pedigree Function", min_value=0.0, max_value=3.0, value=0.5, format="%.3f"
+                )
                 age = st.number_input("Age", min_value=0, max_value=120, value=33)
-            
+
             submit_button = st.form_submit_button("Predict Diabetes Risk")
-        
-        # When form is submitted
+
         if submit_button:
-            # Collect all inputs
-            input_data = {
-                'Pregnancies': pregnancies,
-                'Glucose': glucose,
-                'BloodPressure': blood_pressure,
-                'SkinThickness': skin_thickness,
-                'Insulin': insulin,
-                'BMI': bmi,
-                'DiabetesPedigreeFunction': dpf,
-                'Age': age
+            # Collect raw inputs
+            raw_input = {
+                "Pregnancies": pregnancies,
+                "Glucose": float(glucose),
+                "BloodPressure": float(blood_pressure),
+                "SkinThickness": float(skin_thickness),
+                "Insulin": float(insulin),
+                "BMI": float(bmi),
+                "DiabetesPedigreeFunction": float(dpf),
+                "Age": int(age),
             }
-            
-            # Validate all inputs
+
+            # Validate
             all_valid = True
-            error_messages = []
-            
-            for feature, value in input_data.items():
-                valid, message = validate_input(feature, value)
+            messages = []
+
+            for feat, val in raw_input.items():
+                valid, msg = validate_input(feat, float(val))
                 if not valid:
                     all_valid = False
-                    error_messages.append(message)
-            
+                    messages.append(msg)
+
             if not all_valid:
-                error_container.error("\n".join(error_messages))
+                error_container.error("\n".join(messages))
             else:
                 error_container.empty()
-                
-                # Make prediction
-                prediction, probability = predict_diabetes(input_data, model, feature_names)
-                
-                if prediction is not None:
-                    # Log the prediction
-                    log_prediction(input_data, prediction, probability)
-                    
-                    # Display results
+
+                prediction, probability = predict_diabetes(raw_input, model, feature_names)
+
+                if prediction is not None and probability is not None:
+                    # Log
+                    log_prediction(raw_input, prediction, probability)
+
+                    # Show results
                     st.subheader("Prediction Results")
-                    
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        if prediction == 1:
-                            st.error("⚠️ High Risk of Diabetes")
-                        else:
-                            st.success("✅ Low Risk of Diabetes")
-                    
-                    with col2:
-                        st.metric("Probability", f"{probability:.1%}")
-                    
-                    # Risk interpretation
-                    st.subheader("Risk Interpretation")
-                    
-                    if probability < 0.3:
-                        st.write("**Low Risk:** The model predicts a low probability of diabetes.")
-                        st.write("Recommendation: Maintain a healthy lifestyle with regular exercise and balanced diet.")
-                    elif probability < 0.7:
-                        st.write("**Moderate Risk:** There are some indicators that suggest an elevated risk of diabetes.")
-                        st.write("Recommendation: Consider consulting with a healthcare provider for further evaluation.")
-                    else:
-                        st.write("**High Risk:** The model predicts a high probability of diabetes.")
-                        st.write("Recommendation: Please consult with a healthcare provider as soon as possible for proper diagnosis and care.")
-                    
-                    # Feature importance visualization
-                    st.subheader("Key Risk Factors")
-                    
-                    # Simplified risk factor display
-                    risk_factors = []
-                    
-                    if glucose > 125:
-                        risk_factors.append(("High Glucose Level", f"{glucose} mg/dL", "Elevated blood glucose is a primary indicator of diabetes."))
-                    
-                    if bmi > 30:
-                        risk_factors.append(("Obesity", f"BMI: {bmi:.1f}", "Obesity is strongly associated with type 2 diabetes."))
-                    
-                    if dpf > 0.8:
-                        risk_factors.append(("Family History", f"DPF: {dpf:.3f}", "A high diabetes pedigree function indicates genetic predisposition."))
-                    
-                    if age > 45:
-                        risk_factors.append(("Age", f"{age} years", "Risk of type 2 diabetes increases with age."))
-                    
-                    if risk_factors:
-                        for factor, value, description in risk_factors:
-                            st.write(f"**{factor}:** {value}")
-                            st.write(description)
-                    else:
-                        st.write("No specific high-risk factors identified.")
-                    
-                    # Disclaimer
-                    st.info("""
-                    **Disclaimer:** This prediction is based on a machine learning model and should not be considered as medical advice. 
-                    Please consult with a healthcare professional for proper diagnosis and treatment.
-                    """)
-        
-        # Display information about the system
+                    display_risk_block(prediction, probability)
+                    display_risk_interpretation(probability)
+                    display_risk_factors(glucose, bmi, dpf, age)
+                    display_disclaimer()
+
+        # Extra information sections
         with st.expander("About this System"):
-            st.write("""
-            This diabetes prediction system uses a machine learning model trained on the Pima Indians Diabetes Dataset.
-            The model considers several factors that are associated with diabetes risk:
-            
-            - **Pregnancies:** Number of times pregnant
-            - **Glucose:** Plasma glucose concentration (mg/dL)
-            - **Blood Pressure:** Diastolic blood pressure (mm Hg)
-            - **Skin Thickness:** Triceps skin fold thickness (mm)
-            - **Insulin:** 2-Hour serum insulin (mu U/ml)
-            - **BMI:** Body mass index (weight in kg/(height in m)²)
-            - **Diabetes Pedigree Function:** A function that represents the genetic influence
-            - **Age:** Age in years
-            
-            The system implements a supply chain approach to healthcare data processing, ensuring data quality,
-            efficient processing, and reliable predictions.
-            """)
-        
+            st.write(
+                """
+This diabetes prediction system uses a machine learning model trained on the
+Pima Indians Diabetes Dataset. It considers several factors associated with
+diabetes risk:
+
+- Pregnancies: Number of times pregnant  
+- Glucose: Plasma glucose concentration (mg/dL)  
+- Blood Pressure: Diastolic blood pressure (mm Hg)  
+- Skin Thickness: Triceps skin fold thickness (mm)  
+- Insulin: 2-hour serum insulin (mu U/ml)  
+- BMI: Body mass index (weight in kg/(height in m)²)  
+- Diabetes Pedigree Function: Represents genetic influence  
+- Age: Age in years  
+
+The system applies a supply chain perspective to data handling: quality checks,
+structured processing, and monitoring over time via prediction logs.
+"""
+            )
+
         with st.expander("Understanding Your Results"):
-            st.write("""
-            ### How to Interpret Your Results
-            
-            The prediction is based on statistical patterns found in historical data and provides an estimate of diabetes risk.
-            
-            **Probability Score:**
-            - Below 30%: Generally considered low risk
-            - 30% to 70%: Moderate risk that warrants attention
-            - Above 70%: High risk that should be discussed with a healthcare provider
-            
-            ### Next Steps
-            
-            Regardless of your risk score, the following steps are recommended for diabetes prevention:
-            
-            1. **Maintain a healthy diet** rich in fruits, vegetables, and whole grains
-            2. **Regular physical activity** (at least 150 minutes of moderate exercise per week)
-            3. **Maintain a healthy weight**
-            4. **Regular health check-ups** with your healthcare provider
-            5. **Monitor your blood glucose** if you have risk factors
-            
-            Remember that this tool is meant for educational purposes and does not replace professional medical advice.
-            """)
-    
-    except Exception as e:
-        logger.error(f"Error in Streamlit app: {e}")
-        st.error(f"An unexpected error occurred: {e}")
+            st.write(
+                """
+### How to Interpret Your Results
+
+The probability score is derived from statistical patterns in historical data.
+
+- **Below 30%** – Generally considered low risk  
+- **30% to 70%** – Moderate risk that warrants attention  
+- **Above 70%** – High risk that should be discussed with a healthcare provider  
+
+### General Recommendations (for prevention and risk reduction)
+
+1. Maintain a healthy diet rich in fruits, vegetables, and whole grains  
+2. Engage in regular physical activity (≥150 minutes of moderate exercise/week)  
+3. Maintain a healthy weight  
+4. Schedule regular health check-ups  
+5. Monitor blood glucose if you have risk factors  
+
+This tool is an educational aid, not a diagnostic device.
+"""
+            )
+
+    except Exception as exc:
+        logger.error(f"Unexpected error in Streamlit app: {exc}")
+        st.error(f"An unexpected error occurred: {exc}")
         st.write("Please try again later or contact support if the problem persists.")
+
 
 if __name__ == "__main__":
     main()
